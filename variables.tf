@@ -4,6 +4,12 @@ variable "organization_name" {
   description = "Organization name (O=<my-org>)"
 }
 
+variable "organization_name" {
+  type        = string
+  default     = "my-org"
+  description = "Organization name (O=<my-org>)"
+}
+
 variable "location" {
   type        = string
   description = "Azure Region where the resources should be created"
@@ -36,9 +42,21 @@ variable "law_shared_key" {
   description = "Primary or secondary shared key of Log Analytics Workspace"
 }
 
+variable "law_resource_group_name" {
+  type        = string
+  default     = null
+  description = "Ressource Group of existing Log Analytics Workspace"
+}
+
 variable "service_plan_name" {
   type        = string
   description = "Name of the service plan"
+}
+
+variable "service_plan_sku" {
+  type        = string
+  default     = "S1"
+  description = "SKU for App Service Plan"
 }
 
 variable "service_plan_sku" {
@@ -53,9 +71,15 @@ variable "service_plan_resource_id" {
   description = "Resource ID of the service plan"
 }
 
+variable "enable_application_insights" {
+  type        = bool
+  default     = false
+  description = "Should Terraform create and connect Application Insights for the App services? NOTE: This will prevent Terraform from beeing able to destroy the ressource group!"
+}
+
 variable "app_service_retention_in_days" {
   type        = number
-  default     = 180
+  default     = 90
   description = "How many days http_logs should be kept"
 }
 

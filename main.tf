@@ -43,10 +43,18 @@ resource "azurerm_key_vault" "vault" {
   tags = var.tags
 }
 
+
 # Log Analytics Workspace
 
+# Get exisiting Log Analytics Workspace if law_resource_group_name is defined
+data "azurerm_log_analytics_workspace" "existing-law" {
+  count               = var.law_resource_group_name != null ? 1 : 0
+  name                = var.law_name
+  resource_group_name = var.law_resource_group_name
+}
+
 resource "azurerm_log_analytics_workspace" "law" {
-  count = (var.law_workspace_id == null || var.law_shared_key == null) ? 1 : 0
+  count = length(data.azurerm_log_analytics_workspace.existing-law) > 0 ? 0 : 1
 
   name                = var.law_name
   resource_group_name = var.resource_group_name
@@ -56,14 +64,36 @@ resource "azurerm_log_analytics_workspace" "law" {
   retention_in_days = 30
 
   tags = var.tags
+}
 
-  lifecycle {
-    precondition {
-      condition     = (var.law_workspace_id != null && var.law_shared_key != null) || (var.law_workspace_id == null && var.law_shared_key == null)
-      error_message = "If you want to use your existing Log Analytics Wokrpsce, both 'law_workspace_id' AND 'law_shared_key' need to be set!"
-    }
-  }
+locals {
+  law_id           = length(data.azurerm_log_analytics_workspace.existing-law) > 0 ? data.azurerm_log_analytics_workspace.existing-law[0].id : azurerm_log_analytics_workspace.law[0].id
+  law_workspace_id = length(data.azurerm_log_analytics_workspace.existing-law) > 0 ? data.azurerm_log_analytics_workspace.existing-law[0].workspace_id : azurerm_log_analytics_workspace.law[0].workspace_id
+  law_shared_key   = length(data.azurerm_log_analytics_workspace.existing-law) > 0 ? data.azurerm_log_analytics_workspace.existing-law[0].primary_shared_key : azurerm_log_analytics_workspace.law[0].primary_shared_key
+}
 
+# Application Insights
+# Creating Application Insights will not allow terraform to destroy the ressource group, as app insights create hidden rules that can (currently) not be managed by terraform
+
+resource "azurerm_application_insights" "scepman-primary" {
+  count               = var.enable_application_insights == true ? 1 : 0
+  name                = format("%s_app-insights", var.app_service_name_primary)
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  workspace_id        = local.law_id
+  application_type    = "web"
+
+  tags = var.tags
+}
+resource "azurerm_application_insights" "scepman-cm" {
+  count               = var.enable_application_insights == true ? 1 : 0
+  name                = format("%s_app-insights", var.app_service_name_certificate_master)
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  workspace_id        = local.law_id
+  application_type    = "web"
+
+  tags = var.tags
 }
 
 # App Service Plan
@@ -101,6 +131,23 @@ locals {
     "AppConfig:KeyVaultConfig:RootCertificateConfig:Subject"         = format("CN=SCEPman-Root-CA-V1,OU=%s,O=\"%s\"", data.azurerm_client_config.current.tenant_id, var.organization_name)
   }
 
+  # if app insight exists, add to app settings
+  app_settings_primary_app_insights = length(azurerm_application_insights.scepman-primary) > 0 ? {
+    "APPINSIGHTS_INSTRUMENTATIONKEY"                  = azurerm_application_insights.scepman-primary[0].instrumentation_key
+    "APPLICATIONINSIGHTS_CONNECTION_STRING"           = azurerm_application_insights.scepman-primary[0].connection_string
+    "APPINSIGHTS_PROFILERFEATURE_VERSION"             = "1.0.0"
+    "APPINSIGHTS_SNAPSHOTFEATURE_VERSION"             = "1.0.0"
+    "DiagnosticServices_EXTENSION_VERSION"            = "~3"
+    "InstrumentationEngine_EXTENSION_VERSION"         = "~1"
+    "SnapshotDebugger_EXTENSION_VERSION"              = "~1"
+    "XDT_MicrosoftApplicationInsights_BaseExtensions" = "disabled"
+    "XDT_MicrosoftApplicationInsights_Java"           = "1"
+    "XDT_MicrosoftApplicationInsights_NodeJS"         = "1"
+    "XDT_MicrosoftApplicationInsights_PreemptSdk"     = "disabled"
+    "ApplicationInsightsAgent_EXTENSION_VERSION"      = "~2"
+    "XDT_MicrosoftApplicationInsights_Mode"           = "recommended"
+  } : {}
+
   app_settings_primary_base = {
     "WEBSITE_RUN_FROM_PACKAGE"                          = var.artifacts_url_primary
     "AppConfig:BaseUrl"                                 = format("https://%s.azurewebsites.net", var.app_service_name_primary)
@@ -112,7 +159,7 @@ locals {
   }
 
   // Merge maps will overwrite first by last > default variables, custom variables, resource variables
-  app_settings_primary = merge(local.app_settings_primary_defaults, var.app_settings_primary, local.app_settings_primary_base)
+  app_settings_primary = merge(local.app_settings_primary_defaults, var.app_settings_primary, local.app_settings_primary_app_insights, local.app_settings_primary_base)
 
 }
 
@@ -130,6 +177,12 @@ resource "azurerm_windows_web_app" "app" {
 
   site_config {
     health_check_path = "/probe"
+
+    use_32_bit_worker = false
+    application_stack {
+      current_stack  = "dotnet"
+      dotnet_version = "v6.0"
+    }
   }
 
   app_settings = local.app_settings_primary
@@ -146,7 +199,7 @@ resource "azurerm_windows_web_app" "app" {
 
     http_logs {
       file_system {
-        retention_in_days = var.app_service_retention_in_days
+        retention_in_days = length(azurerm_application_insights.scepman-primary) > 0 ? 0 : var.app_service_retention_in_days
         retention_in_mb   = var.app_service_retention_in_mb
       }
     }
@@ -165,6 +218,7 @@ resource "azurerm_windows_web_app" "app" {
       app_settings["AppConfig:AuthConfig:ManagedIdentityEnabledOnUnixTime"],
       app_settings["AppConfig:AuthConfig:ManagedIdentityPermissionLevel"],
       app_settings["AppConfig:CertMaster:URL"],
+      app_settings["WEBSITE_HEALTHCHECK_MAXPINGFAILURES"],
       sticky_settings
     ]
   }
@@ -176,6 +230,23 @@ locals {
 
   app_settings_certificate_master_defaults = {}
 
+  # if app insight exists, add to app settings
+  app_settings_certificate_master_app_insights = length(azurerm_application_insights.scepman-cm) > 0 ? {
+    "APPINSIGHTS_INSTRUMENTATIONKEY"                  = azurerm_application_insights.scepman-cm[0].instrumentation_key
+    "APPLICATIONINSIGHTS_CONNECTION_STRING"           = azurerm_application_insights.scepman-cm[0].connection_string
+    "APPINSIGHTS_PROFILERFEATURE_VERSION"             = "1.0.0"
+    "APPINSIGHTS_SNAPSHOTFEATURE_VERSION"             = "1.0.0"
+    "DiagnosticServices_EXTENSION_VERSION"            = "~3"
+    "InstrumentationEngine_EXTENSION_VERSION"         = "~1"
+    "SnapshotDebugger_EXTENSION_VERSION"              = "~1"
+    "XDT_MicrosoftApplicationInsights_BaseExtensions" = "disabled"
+    "XDT_MicrosoftApplicationInsights_Java"           = "1"
+    "XDT_MicrosoftApplicationInsights_NodeJS"         = "1"
+    "XDT_MicrosoftApplicationInsights_PreemptSdk"     = "disabled"
+    "ApplicationInsightsAgent_EXTENSION_VERSION"      = "~2"
+    "XDT_MicrosoftApplicationInsights_Mode"           = "recommended"
+  } : {}
+
   app_settings_certificate_master_base = {
     "WEBSITE_RUN_FROM_PACKAGE"                    = var.artifacts_url_certificate_master
     "AppConfig:AzureStorage:TableStorageEndpoint" = azurerm_storage_account.storage.primary_table_endpoint
@@ -186,7 +257,7 @@ locals {
   }
 
   // Merge maps will overwrite first by last > default variables, custom variables, resource variables
-  app_settings_certificate_master = merge(local.app_settings_certificate_master_defaults, var.app_settings_certificate_master, local.app_settings_certificate_master_base)
+  app_settings_certificate_master = merge(local.app_settings_certificate_master_defaults, var.app_settings_certificate_master, local.app_settings_certificate_master_app_insights, local.app_settings_certificate_master_base)
 }
 
 resource "azurerm_windows_web_app" "app_cm" {
@@ -202,6 +273,11 @@ resource "azurerm_windows_web_app" "app_cm" {
 
   site_config {
     health_check_path = "/probe"
+    use_32_bit_worker = false
+    application_stack {
+      current_stack  = "dotnet"
+      dotnet_version = "v6.0"
+    }
   }
 
   app_settings = local.app_settings_certificate_master
@@ -218,7 +294,7 @@ resource "azurerm_windows_web_app" "app_cm" {
 
     http_logs {
       file_system {
-        retention_in_days = var.app_service_retention_in_days
+        retention_in_days = length(azurerm_application_insights.scepman-cm) > 0 ? 0 : var.app_service_retention_in_days
         retention_in_mb   = var.app_service_retention_in_mb
       }
     }
@@ -231,6 +307,7 @@ resource "azurerm_windows_web_app" "app_cm" {
       app_settings["AppConfig:AuthConfig:ManagedIdentityEnabledOnUnixTime"],
       app_settings["AppConfig:AuthConfig:ManagedIdentityPermissionLevel"],
       app_settings["AppConfig:AuthConfig:SCEPmanAPIScope"],
+      app_settings["WEBSITE_HEALTHCHECK_MAXPINGFAILURES"],
       sticky_settings
     ]
   }
